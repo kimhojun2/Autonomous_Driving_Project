@@ -1,0 +1,434 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import rospy
+import rospkg
+import sys
+import os
+import copy
+import numpy as np
+import json
+from morai_msgs.msg import GPSMessage
+from pyproj import Proj, Transformer
+
+import firebase_admin
+from firebase_admin import credentials
+from firebase_admin import firestore, messaging
+
+from math import cos,sin,sqrt,pow,atan2,pi
+from geometry_msgs.msg import Point32,PoseStamped, PoseWithCovarianceStamped
+from nav_msgs.msg import Odometry,Path
+from std_msgs.msg import String
+
+
+current_path = os.path.dirname(os.path.realpath(__file__))
+sys.path.append(current_path)
+
+from lib.mgeo.class_defs import *
+
+class dijkstra_path_pub :
+    def __init__(self):
+        rospy.init_node('dijkstra_path_pub', anonymous=True)
+
+        self.global_path_pub = rospy.Publisher('/global_path',Path, queue_size = 1)
+        self.visit_order_pub = rospy.Publisher('/visit_order_topic', String, queue_size=10)
+
+        self.proj_UTM = Proj(proj='utm', zone=52, ellps='WGS84', preserve_units=False)
+        self.proj_WGS84 = Proj(proj='latlong', datum='WGS84')
+
+
+        #TODO: (1) Mgeo data 읽어온 후 데이터 확인
+        # load_path = os.path.normpath(os.path.join(current_path, 'lib/mgeo_data/R_KR_PG_K-City'))
+        load_path = os.path.normpath(os.path.join(current_path, 'lib/mgeo_data/R_KR_PR_Sangam_NoBuildings'))
+        mgeo_planner_map = MGeo.create_instance_from_json(load_path)
+
+        node_set = mgeo_planner_map.node_set
+        link_set = mgeo_planner_map.link_set
+
+        self.nodes=node_set.nodes
+        self.links=link_set.lines
+
+    
+        self.global_planner=Dijkstra(self.nodes,self.links)
+
+        self.is_goal_pose = False
+        self.is_init_pose = False
+
+        self.is_store_start = False
+
+        self.visit_order = []
+
+        self.total_distance = 0
+
+        # 이미 초기화된 앱이 있는지 확인
+        if not firebase_admin._apps:
+            # Firebase Admin SDK를 초기화
+            cred = credentials.Certificate('/home/morai/catkin_ws/src/ssafy_3/key/ifind-firebase-adminsdk.json')
+            firebase_admin.initialize_app(cred, {
+                'databaseURL': 'https://ifind.firebaseio.com'
+            })
+
+        # Firestore 데이터베이스 가져오기
+        self.db = firestore.client()
+
+        self.gps_sub = rospy.Subscriber("/gps", GPSMessage, self.init_callback)
+        self.goal_callback()
+
+        print(self.is_goal_pose, self.is_init_pose)
+
+        while True:
+            if self.is_goal_pose == True and self.is_init_pose == True:
+                break
+            else:
+                # rospy.loginfo('Waiting goal pose data')
+                # rospy.loginfo('Waiting init pose data')
+                pass
+
+
+        self.global_path_msg = Path()
+        self.global_path_msg.header.frame_id = '/map'
+
+        self.global_path_msg = self.calc_dijkstra_path_through_nodes()
+            
+        # dijkstra 이용해 만든 Global Path 메세지 를 전송         
+        self.global_path_pub.publish(self.global_path_msg)
+
+        # firebase에 global path 쓰기
+        self.store_global_path()
+
+        # firebase에 방문 순서 쓰기
+        self.store_visit_order()
+            
+            # rate.sleep()
+
+    def store_global_path(self):
+
+        # 글로벌 패스 메시지에서 경로 데이터 추출 및 1/100로 줄이기
+        reduced_path_data = self.global_path_msg.poses[::50]  # 100개 포인트마다 하나씩 추출
+
+        # Firestore에 저장할 경로 데이터
+        path_data_for_firestore = []
+
+        # 추출된 경로 데이터 변환 및 Firestore용 데이터 준비
+        for pose_stamped in reduced_path_data:
+            x = pose_stamped.pose.position.x
+            y = pose_stamped.pose.position.y
+
+            # UTM 좌표를 위도와 경도로 변환
+            lat, lon = self.convert_xy_to_latlon(x, y)
+            path_data_for_firestore.append({'latitude': lat, 'longitude': lon})
+
+        # Firestore에 글로벌 패스 데이터 쓰기
+        self.db.collection('morai').document('path').set({'path' : path_data_for_firestore, 'total_distance' :self.total_distance})
+
+
+
+    def store_visit_order(self):
+        # Firestore에 저장할 경로 데이터
+        order_data_for_firestore = []
+
+        # 추출된 경로 데이터 변환 및 Firestore용 데이터 준비
+        for node in self.visit_order:
+            x = node['x']
+            y = node['y']
+
+            # UTM 좌표를 위도와 경도로 변환
+            lat, lon = self.convert_xy_to_latlon(x, y)
+            order_data_for_firestore.append({'latitude': lat, 'longitude': lon})
+
+        # Firestore에 글로벌 패스 데이터 쓰기
+        order_document_data = {'stop': order_data_for_firestore[:-1]}
+        self.db.collection('morai').document('order').set(order_document_data)
+
+        # 방문 노드 publish
+        visit_order_json = json.dumps(self.visit_order)
+        self.visit_order_pub.publish(visit_order_json)
+        
+
+
+    def calc_dijkstra_path_through_nodes(self):
+        # 현재 위치에서 시작
+        current_node = self.start_node
+        visited_nodes = [current_node]
+        total_path = []
+        self.total_distance = 0
+
+        while self.selected_nodes:
+            nearest_node = None
+            nearest_distance = float('inf')
+            nearest_path = None
+
+            # 선택된 노드들 중에서 현재 노드에 가장 가까운 노드를 찾음
+            for target in self.selected_nodes:
+                result, path = self.global_planner.find_shortest_path(current_node, target['idx'])
+                if result and path['total_distance'] < nearest_distance:
+                    nearest_node = target
+                    nearest_distance = path['total_distance']
+                    nearest_path = path
+
+            if nearest_node:
+                # 가장 가까운 노드를 방문 경로에 추가
+                visited_nodes.append(nearest_node['idx'])
+                self.visit_order.append(nearest_node)
+                self.selected_nodes.remove(nearest_node)
+                current_node = nearest_node['idx']
+                # 해당 노드까지의 경로를 전체 경로에 추가
+                total_path.extend(nearest_path['point_path'])
+                self.total_distance += nearest_distance
+
+        # 마지막으로 시작 노드로 돌아가는 경로 추가
+        result, return_path = self.global_planner.find_shortest_path(current_node, self.start_node)
+        if result:
+            total_path.extend(return_path['point_path'])
+            self.total_distance += return_path['total_distance'] 
+            visited_nodes.append(self.start_node)
+            self.visit_order.append(self.start)
+
+        # Global Path 메시지 생성
+        global_path_msg = Path()
+        global_path_msg.header.frame_id = '/map'
+        for point in total_path:
+            pose = PoseStamped()
+            pose.pose.position.x = point[0]
+            pose.pose.position.y = point[1]
+            pose.pose.position.z = 0
+            global_path_msg.poses.append(pose)
+
+        return global_path_msg
+
+    
+    def convert_latlon_to_xy(self, lon, lat):
+        # 위도와 경도 UTM 좌표계로 변환
+        xy_zone = self.proj_UTM(lon, lat)
+
+        x = 0.0
+        y = 0.0
+        if lon == 0 and lat == 0:
+            x = 0.0
+            y = 0.0
+        else:
+            x = xy_zone[0] - self.e_o
+            y = xy_zone[1] - self.n_o    
+
+        return x, y
+    
+    def convert_xy_to_latlon(self, x, y):
+        # UTM 좌표에 offset 적용하기 전의 위치 복원
+
+        if x == 0 and y == 0:
+            original_x  = 0.0
+            original_y  = 0.0
+        else:
+            original_x  = x + self.e_o
+            original_y  = y + self.n_o
+
+        # 변환 객체 생성
+        transformer = Transformer.from_proj(self.proj_UTM, self.proj_WGS84, always_xy=True)
+
+        # 좌표 변환
+        lon, lat = transformer.transform(original_x, original_y)
+        return lat, lon
+
+    def init_callback(self,msg):
+        self.lat = msg.latitude
+        self.lon = msg.longitude
+        self.e_o = msg.eastOffset
+        self.n_o = msg.northOffset
+
+        self.is_gps=True
+        
+        x, y = self.convert_latlon_to_xy(self.lon, self.lat)
+
+        nearest_node_id = self.find_nearest_node_idx(x, y)
+
+        self.start_node = nearest_node_id
+        self.start = {'x' : x, 'y' : y}
+        self.is_init_pose = True
+
+        # 출발 지점 파이어 베이스에 쓰기
+        if self.is_store_start == False:
+            self.is_store_start = True
+            order_document_data = {'latitude': msg.latitude, 'longitude': msg.longitude}
+            self.db.collection('morai').document('start').set(order_document_data)        
+
+    def goal_callback(self):
+
+        doc = self.db.collection('morai').document('node').get()
+
+        self.selected_nodes = []
+
+        if doc.exists:
+            # 문서의 데이터를 딕셔너리 형태로 변환
+            data = doc.to_dict()
+
+            # 변환된 데이터를 리스트로 재구성
+            data_list = []
+            for key, value in data.items():
+                node_data = {'number': key}
+                node_data.update(value)
+                data_list.append(node_data)
+
+            # 승하차 있는 node만 가져오기
+            for node in data_list:
+                if node['select']:
+                    lat = node['latitude']
+                    lon = node['longitude']
+
+                    # 위도와 경도를 UTM 좌표계로 변환
+                    x, y = self.convert_latlon_to_xy(lon, lat)
+
+                    idx = self.find_nearest_node_idx(x, y)
+                    self.selected_nodes.append({'number' : node['number'], 'x' : x, 'y' : y, 'idx' : idx, 'select' : node['select'], 'stop' : node['stop']})            
+                    
+                    self.is_goal_pose = True
+        else:
+            print("저장된 하차 지점이 없습니다.")
+
+
+    def find_nearest_node_idx(self, x, y):
+        nearest_node_id = None
+        min_distance = float('inf')
+        for node_id, node in self.nodes.items():
+            node_x = node.point[0]
+            node_y = node.point[1]
+            distance = sqrt((node_x - x) ** 2 + (node_y - y) ** 2)
+            if distance < min_distance:
+                nearest_node_id = node_id
+                min_distance = distance
+
+        return nearest_node_id
+
+    def calc_dijkstra_path_node(self, start_node, end_node):
+
+        result, path = self.global_planner.find_shortest_path(start_node, end_node)
+
+        # dijkstra 경로 데이터를 ROS Path 메세지 형식에 맞춰 정의
+        out_path = Path()
+        out_path.header.frame_id = '/map'
+        
+        for point in path['point_path']:
+            pose = PoseStamped()
+            pose.pose.position.x = point[0]
+            pose.pose.position.y = point[1]
+            pose.pose.position.z = 0 
+            out_path.poses.append(pose)
+        
+
+        return out_path
+
+class Dijkstra:
+    def __init__(self, nodes, links):
+        self.nodes = nodes
+        self.links = links
+        self.weight = self.get_weight_matrix()
+        self.lane_change_link_idx = []
+
+    def get_weight_matrix(self):
+        # 초기 설정
+        weight = dict() 
+        for from_node_id, from_node in self.nodes.items():
+            # 현재 노드에서 다른 노드로 진행하는 모든 weight
+            weight_from_this_node = dict()
+            for to_node_id, to_node in self.nodes.items():
+                weight_from_this_node[to_node_id] = float('inf')
+            # 전체 weight matrix에 추가
+            weight[from_node_id] = weight_from_this_node
+
+        for from_node_id, from_node in self.nodes.items():
+            weight[from_node_id][from_node_id] = 0
+
+            for to_node in from_node.get_to_nodes():
+                # 현재 노드에서 to_node로 연결되어 있는 링크를 찾고, 그 중에서 가장 빠른 링크를 찾아준다
+                shortest_link, min_cost = self.find_shortest_link_leading_to_node(from_node,to_node)
+                weight[from_node_id][to_node.idx] = min_cost           
+
+        return weight
+
+    def find_shortest_link_leading_to_node(self, from_node,to_node):
+        # 현재 노드에서 to_node로 연결되어 있는 링크를 찾고, 그 중에서 가장 빠른 링크를 찾아준다
+
+        to_links = []
+        for link in from_node.get_to_links():
+            if link.to_node is to_node:
+                to_links.append(link)
+        
+        shortest_link = None
+        min_cost = float('inf')
+
+        for link in to_links:
+            if link.cost < min_cost:
+                min_cost = link.cost
+                shortest_link = link       
+
+        return shortest_link, min_cost
+        
+    def find_nearest_node_idx(self, distance, s):        
+        idx_list = list(self.nodes.keys())
+        min_value = float('inf')
+        min_idx = idx_list[-1]
+
+        for idx in idx_list:
+            if distance[idx] < min_value and s[idx] == False :
+                min_value = distance[idx]
+                min_idx = idx
+        return min_idx
+
+    def find_shortest_path(self, start_node_idx, end_node_idx): 
+        s = dict()
+        from_node = dict() 
+        for node_id in self.nodes.keys():
+            s[node_id] = False
+            from_node[node_id] = start_node_idx
+
+        s[start_node_idx] = True
+        distance =copy.deepcopy(self.weight[start_node_idx])
+
+        #TODO: (5) Dijkstra 핵심 코드
+        for i in range(len(self.nodes.keys()) - 1):
+            selected_node_idx = self.find_nearest_node_idx(distance, s)
+            s[selected_node_idx] = True            
+            for j, to_node_idx in enumerate(self.nodes.keys()):
+                if s[to_node_idx] == False:
+                    distance_candidate = distance[selected_node_idx] + self.weight[selected_node_idx][to_node_idx]
+                    if distance_candidate < distance[to_node_idx]:
+                        distance[to_node_idx] = distance_candidate
+                        from_node[to_node_idx] = selected_node_idx
+
+        #TODO: (6) node path 생성
+        tracking_idx = end_node_idx
+        node_path = [end_node_idx]
+        
+        while start_node_idx != tracking_idx:
+            tracking_idx = from_node[tracking_idx]
+            node_path.append(tracking_idx)     
+
+        node_path.reverse()
+
+        #TODO: (7) link path 생성
+        link_path = []
+        for i in range(len(node_path) - 1):
+            from_node_idx = node_path[i]
+            to_node_idx = node_path[i + 1]
+
+            from_node = self.nodes[from_node_idx]
+            to_node = self.nodes[to_node_idx]
+
+            shortest_link, min_cost = self.find_shortest_link_leading_to_node(from_node,to_node)
+            link_path.append(shortest_link.idx)
+
+        #TODO: (8) Result 판별
+        if len(link_path) == 0:
+            return False, {'node_path': node_path, 'link_path':link_path, 'point_path':[]}
+
+        #TODO: (9) point path 생성
+        point_path = []        
+        for link_id in link_path:
+            link = self.links[link_id]
+            for point in link.points:
+                point_path.append([point[0], point[1], 0])
+
+        return True, {'node_path': node_path, 'link_path':link_path, 'point_path':point_path, 'total_distance' : distance[end_node_idx]}
+
+if __name__ == '__main__':
+    
+    dijkstra_path_pub = dijkstra_path_pub()

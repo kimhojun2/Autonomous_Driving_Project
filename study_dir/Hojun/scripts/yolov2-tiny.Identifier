@@ -1,0 +1,4 @@
+[ZoneTransfer]
+ZoneId=3
+ReferrerUrl=https://pjreddie.com/darknet/yolo/
+HostUrl=https://pjreddie.com/media/files/yolov2-tiny.weights
